@@ -129,6 +129,7 @@ LinearBackend = Literal[
     "torch",
     "aiter",
     "fbgemm",
+    "emulation",
 ]
 
 
@@ -171,7 +172,8 @@ class KernelConfig:
     - "deep_gemm": Use DeepGEMM kernels
     - "torch": Use PyTorch native scaled_mm kernels
     - "aiter": Use AMD AITer kernels (ROCm only)
-    - "fbgemm": Use FBGEMM kernels"""
+    - "fbgemm": Use FBGEMM kernels
+    - "emulation": Use slow dequant-to-BF16 emulation (for testing only)"""
 
     @field_validator("moe_backend", mode="before")
     @classmethod
