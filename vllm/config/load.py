@@ -23,7 +23,7 @@ logger = init_logger(__name__)
 class LoadConfig:
     """Configuration for loading the model weights."""
 
-    load_format: str | LoadFormats = "instanttensor"
+    load_format: str | LoadFormats = "auto"
     """
     The format of the model weights to load.
 
