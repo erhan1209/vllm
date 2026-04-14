@@ -37,6 +37,9 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
+    initialize_mamba_ssu_backend,
+)
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
@@ -383,6 +386,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.attn_backends, self.attn_groups, attn_cg_support = init_attn_backend(
             self.kv_cache_config, self.vllm_config, self.device
         )
+        initialize_mamba_ssu_backend(self.vllm_config.mamba_config)
         cudagraph_mode = self.compilation_config.resolve_cudagraph_mode_and_sizes(
             attn_cg_support.min_cg_support,
             attn_cg_support.min_cg_attn_backend,
@@ -490,7 +494,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         slot_mappings_by_layer = self.execute_model_state.slot_mappings_by_layer
         hidden_states = self.execute_model_state.hidden_states
         aux_hidden_states = self.execute_model_state.aux_hidden_states
-        num_tokens_across_dp = self.execute_model_state.num_tokens_across_dp
         self.execute_model_state = None
 
         # dummy run the eagle speculator's propose to ensure DP/EP sync.
@@ -522,7 +525,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 next_prefill_tokens=self.req_states.next_prefill_tokens,
                 temperature=self.sampler.sampling_states.temperature.gpu,
                 seeds=self.sampler.sampling_states.seeds.gpu,
-                num_tokens_across_dp=num_tokens_across_dp,
                 dummy_run=True,
                 skip_attn_for_dummy_run=skip_attn,
                 mm_inputs=mm_inputs,
@@ -1181,7 +1183,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states=hidden_states,
             aux_hidden_states=aux_hidden_states,
             kv_connector_output=kv_connector_output,
-            num_tokens_across_dp=num_tokens_across_dp,
         )
 
         if not self.is_last_pp_rank:
@@ -1206,7 +1207,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states = self.execute_model_state.hidden_states
         aux_hidden_states = self.execute_model_state.aux_hidden_states
         kv_connector_output = self.execute_model_state.kv_connector_output
-        num_tokens_across_dp = self.execute_model_state.num_tokens_across_dp
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -1299,7 +1299,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.req_states.next_prefill_tokens,
                 self.sampler.sampling_states.temperature.gpu,
                 self.sampler.sampling_states.seeds.gpu,
-                num_tokens_across_dp=num_tokens_across_dp,
                 mm_inputs=mm_inputs,
             )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
@@ -1407,4 +1406,3 @@ class ExecuteModelState(NamedTuple):
     hidden_states: torch.Tensor | None
     aux_hidden_states: list[torch.Tensor] | None
     kv_connector_output: KVConnectorOutput | None
-    num_tokens_across_dp: torch.Tensor | None
