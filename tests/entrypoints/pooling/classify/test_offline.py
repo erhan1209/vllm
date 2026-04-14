@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import logging
 import weakref
 
 import pytest
 import torch
 
 from tests.models.utils import softmax
-from vllm import LLM, ClassificationRequestOutput, PoolingParams, PoolingRequestOutput
+from vllm import LLM, ClassificationRequestOutput, PoolingParams
 from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.tasks import PoolingTask
 
@@ -64,18 +63,6 @@ def test_list_prompts(llm: LLM):
         assert isinstance(outputs[i], ClassificationRequestOutput)
         assert outputs[i].prompt_token_ids == prompt_token_ids
         assert len(outputs[i].outputs.probs) == num_labels
-
-
-@pytest.mark.skip_global_cleanup
-def test_token_classify(llm: LLM, caplog_vllm):
-    with caplog_vllm.at_level(level=logging.WARNING, logger="vllm"):
-        outputs = llm.encode(prompt, pooling_task="token_classify", use_tqdm=False)
-        assert "deprecated" in caplog_vllm.text
-
-    assert len(outputs) == 1
-    assert isinstance(outputs[0], PoolingRequestOutput)
-    assert outputs[0].prompt_token_ids == prompt_token_ids
-    assert outputs[0].outputs.data.shape == (len(prompt_token_ids), num_labels)
 
 
 @pytest.mark.skip_global_cleanup

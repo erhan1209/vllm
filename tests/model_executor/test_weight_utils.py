@@ -102,13 +102,6 @@ class TestMaybeRemapKvScaleName:
         )
         assert result == "model.layers.0.self_attn.attn.v_scale"
 
-    def test_deprecated_kv_scale(self):
-        """Old format: kv_scale -> attn.k_scale (deprecated)"""
-        result = maybe_remap_kv_scale_name(
-            "model.layers.0.self_attn.kv_scale", self.PARAMS_DICT
-        )
-        assert result == "model.layers.0.self_attn.attn.k_scale"
-
     def test_default_bare_k_scale(self):
         """Default format: .k_scale -> .attn.k_scale"""
         result = maybe_remap_kv_scale_name(
