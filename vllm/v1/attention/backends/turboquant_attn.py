@@ -30,10 +30,7 @@ from vllm.triton_utils import triton
 from vllm.v1.attention.ops.turboquant_kv_cache import (
     get_turboquant_centroids,
     get_turboquant_layout,
-    get_turboquant_mse_to_qjl_matrix,
-    get_turboquant_mse_transform_matrix,
     get_turboquant_qjl_matrix,
-    get_turboquant_qjl_transform_matrix,
     get_turboquant_rotation,
 )
 from vllm.v1.attention.backend import (
@@ -312,36 +309,6 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     get_turboquant_qjl_matrix(device, group_dims[0], seed_offset=307),
                     get_turboquant_qjl_matrix(device, group_dims[1], seed_offset=401),
                 )
-                layer._tq_group_mse_matrices = (
-                    get_turboquant_mse_transform_matrix(
-                        device, group_dims[0], seed_offset=101
-                    ),
-                    get_turboquant_mse_transform_matrix(
-                        device, group_dims[1], seed_offset=211
-                    ),
-                )
-                layer._tq_group_qjl_matrices = (
-                    get_turboquant_qjl_transform_matrix(
-                        device, group_dims[0], seed_offset=307
-                    ),
-                    get_turboquant_qjl_transform_matrix(
-                        device, group_dims[1], seed_offset=401
-                    ),
-                )
-                layer._tq_group_mse_to_qjl = (
-                    get_turboquant_mse_to_qjl_matrix(
-                        device,
-                        group_dims[0],
-                        mse_seed_offset=101,
-                        qjl_seed_offset=307,
-                    ),
-                    get_turboquant_mse_to_qjl_matrix(
-                        device,
-                        group_dims[1],
-                        mse_seed_offset=211,
-                        qjl_seed_offset=401,
-                    ),
-                )
                 recipe = self.tq_config.grouped_recipe
                 assert recipe is not None
                 layout = get_turboquant_layout(recipe, self.head_size)
@@ -566,9 +533,6 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             group_qjl=getattr(layer, "_tq_group_qjl", None),
             group_centroids=getattr(layer, "_tq_group_centroids", None),
             group_indices=getattr(layer, "_tq_group_indices", None),
-            group_mse_matrices=getattr(layer, "_tq_group_mse_matrices", None),
-            group_qjl_matrices=getattr(layer, "_tq_group_qjl_matrices", None),
-            group_mse_to_qjl=getattr(layer, "_tq_group_mse_to_qjl", None),
         )
 
     # ------------------------------------------------------------------ #
@@ -676,10 +640,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 # avoid O(cached_len) full-dequant per continuation.
                 # For large continuations, fall back to _continuation_prefill.
                 cached_len = seq_len - q_len
-                if (
-                    q_len <= _CONTINUATION_DECODE_THRESHOLD
-                    or self.tq_config.use_qjl_residual
-                ):
+                if q_len <= _CONTINUATION_DECODE_THRESHOLD:
                     # Fast path: treat each query as a decode request with
                     # incremental seq_lens for causal masking.
                     synth_seq_lens = torch.arange(

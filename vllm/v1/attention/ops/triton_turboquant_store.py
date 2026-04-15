@@ -17,13 +17,8 @@ import torch
 from vllm.model_executor.layers.quantization.turboquant.centroids import get_centroids
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.ops.turboquant_kv_cache import (
-    get_turboquant_kernel_meta,
-    get_turboquant_layout,
     quantize_turboquant_vectors,
     validate_turboquant_group_indices,
-)
-from vllm.v1.attention.ops.triton_turboquant_kv_update import (
-    turboquant_write_packed_kv,
 )
 from vllm.v1.attention.ops.triton_turboquant_decode import _use_fp8_e4b15
 
@@ -394,59 +389,6 @@ def _tq_fused_store_mse(
     )
 
 
-@triton.jit
-def _tq_grouped_store_value(
-    Value_ptr,
-    KV_cache_ptr,
-    Slot_mapping_ptr,
-    stride_cache_block: tl.constexpr,
-    stride_cache_pos: tl.constexpr,
-    stride_cache_head: tl.constexpr,
-    stride_cache_dim: tl.constexpr,
-    D: tl.constexpr,
-    H: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    KPS: tl.constexpr,
-    VQB: tl.constexpr,
-    VAL_DATA_BYTES: tl.constexpr,
-    BLOCK_VAL: tl.constexpr,
-    BLOCK_GRP: tl.constexpr = 16,
-):
-    pid = tl.program_id(0)
-    token_idx = pid // H
-    head_idx = pid % H
-
-    slot = tl.load(Slot_mapping_ptr + token_idx)
-    if slot < 0:
-        return
-    blk = slot // BLOCK_SIZE
-    off = slot % BLOCK_SIZE
-    slot_base = (
-        blk * stride_cache_block + off * stride_cache_pos + head_idx * stride_cache_head
-    )
-
-    base = pid * D
-    d_offs = tl.arange(0, BLOCK_D)
-    d_mask = d_offs < D
-
-    _store_quantized_value(
-        Value_ptr,
-        KV_cache_ptr,
-        base,
-        slot_base,
-        d_offs,
-        d_mask,
-        D=D,
-        KPS=KPS * stride_cache_dim,
-        VQB=VQB,
-        VAL_DATA_BYTES=VAL_DATA_BYTES * stride_cache_dim,
-        BLOCK_D=BLOCK_D,
-        BLOCK_VAL=BLOCK_VAL,
-        BLOCK_GRP=BLOCK_GRP,
-    )
-
-
 # ═══════════════════════════════════════════════════════════════════════
 # Launcher
 # ═══════════════════════════════════════════════════════════════════════
@@ -470,9 +412,6 @@ def triton_turboquant_store(
     group_qjl: tuple[torch.Tensor, torch.Tensor] | None = None,
     group_centroids: dict[int, torch.Tensor] | None = None,
     group_indices: tuple[torch.Tensor, torch.Tensor] | None = None,
-    group_mse_matrices: tuple[torch.Tensor, torch.Tensor] | None = None,
-    group_qjl_matrices: tuple[torch.Tensor, torch.Tensor] | None = None,
-    group_mse_to_qjl: tuple[torch.Tensor, torch.Tensor] | None = None,
 ):
     """Launch TQ store kernel or grouped reference store path."""
     N, H, D = key.shape
@@ -512,64 +451,24 @@ def triton_turboquant_store(
         offsets = torch.remainder(valid_slots, kv_cache.shape[1])
         value_packed_size = val_data_bytes + 4
         kv_cache[blocks, offsets, :, :] = 0
-        if (
-            key.device.type == "cuda"
-            and group_mse_matrices is not None
-            and group_qjl_matrices is not None
-            and group_mse_to_qjl is not None
-        ):
-            kernel_meta = get_turboquant_kernel_meta(key.device, D)
-            turboquant_write_packed_kv(
-                x=key,
-                cache=kv_cache[..., :key_packed_size],
-                slot_mapping=slot_mapping,
-                layout=get_turboquant_layout(grouped_recipe, D),
-                group_indices=group_indices,
-                mse_transform_matrices=group_mse_matrices,
-                qjl_transform_matrices=group_qjl_matrices,
-                mse_to_qjl_matrices=group_mse_to_qjl,
-                centroids=group_centroids,
-            )
-            v_flat = value.float().reshape(NH, D).contiguous()
-            _tq_grouped_store_value[(NH,)](
-                v_flat,
-                kv_cache.view(-1),
-                slot_mapping,
-                stride_cache_block=stride_block,
-                stride_cache_pos=stride_pos,
-                stride_cache_head=stride_head,
-                stride_cache_dim=kv_cache.stride(3),
-                D=D,
-                H=H,
-                BLOCK_SIZE=block_size,
-                BLOCK_D=BLOCK_D,
-                KPS=key_packed_size,
-                VQB=value_quant_bits,
-                VAL_DATA_BYTES=val_data_bytes,
-                BLOCK_VAL=BLOCK_VAL,
-                BLOCK_GRP=block_grp,
-                num_warps=kernel_meta.update_num_warps,
-                num_stages=1,
-            )
-        else:
-            packed_value = _pack_uniform_values_reference(
-                value.to(torch.float32), value_quant_bits
-            )
-            packed_key = quantize_turboquant_vectors(
-                key.to(torch.float32),
-                grouped_recipe,
-                group_rotations,
-                group_qjl,
-                group_centroids,
-                group_indices,
-            )
-            kv_cache[blocks, offsets, :, :key_packed_size] = packed_key[valid_mask]
-            kv_cache[
-                blocks,
-                offsets,
-                :,
-                key_packed_size : key_packed_size + value_packed_size,
-            ] = packed_value[valid_mask]
+        packed_value = _pack_uniform_values_reference(
+            value.to(torch.float32), value_quant_bits
+        )
+        packed_key = quantize_turboquant_vectors(
+            key.to(torch.float32),
+            grouped_recipe,
+            group_rotations,
+            group_qjl,
+            group_centroids,
+            group_indices,
+        )
+        kv_cache[blocks, offsets, :, :key_packed_size] = packed_key[valid_mask]
+        kv_cache[
+            blocks,
+            offsets,
+            :,
+            key_packed_size : key_packed_size + value_packed_size,
+        ] = packed_value[valid_mask]
         return
     if PiT is None or midpoints is None:
         raise ValueError("PiT and midpoints are required for legacy TurboQuant store.")
