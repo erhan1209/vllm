@@ -84,3 +84,29 @@ def get_centroids(d: int, bits: int) -> torch.Tensor:
     """Get precomputed Lloyd-Max centroids (cached)."""
     centroids, _ = solve_lloyd_max(d, bits)
     return centroids
+
+
+@lru_cache(maxsize=32)
+def get_residual_scale(d: int, bits: int) -> float:
+    """Approximate 1-bit residual correction scale for TurboQuant.
+
+    After Lloyd-Max quantization, we model the residual as an approximately
+    isotropic zero-mean random vector. A 1-bit sign sketch then uses the
+    Gaussian proxy E|X| = sigma * sqrt(2 / pi) to convert signs back into a
+    score correction constant.
+    """
+    centroids, boundaries = solve_lloyd_max(d, bits)
+    sigma2 = 1.0 / d
+
+    def pdf(x: float) -> float:
+        return _gaussian_pdf(x, sigma2)
+
+    mse = 0.0
+    finite_edges = [-10.0 / math.sqrt(d), *boundaries.tolist(), 10.0 / math.sqrt(d)]
+    for i, c in enumerate(centroids.tolist()):
+        a = finite_edges[i]
+        b = finite_edges[i + 1]
+        mse += _trapz(lambda x: (x - c) ** 2 * pdf(x), a, b, n=400)
+
+    sigma_resid = math.sqrt(max(mse, 1e-12))
+    return sigma_resid * math.sqrt(2.0 / math.pi)

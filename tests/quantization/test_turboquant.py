@@ -12,6 +12,7 @@ import torch
 
 from vllm.model_executor.layers.quantization.turboquant.centroids import (
     get_centroids,
+    get_residual_scale,
     solve_lloyd_max,
 )
 from vllm.model_executor.layers.quantization.turboquant.config import (
@@ -47,14 +48,25 @@ PRESET_EXPECTED = {
         key_mse_bits=0, value_quant_bits=4,
         mse_bits=4, n_centroids=16, centroid_bits=4,
         norm_correction=False,
+        use_qjl_residual=False,
         key_packed_size=128, value_packed_size=68,
         slot_size=196, slot_size_aligned=196,
+    ),
+    "turboquant_4bit": dict(
+        key_fp8=False, key_quant_bits=3,
+        key_mse_bits=3, value_quant_bits=4,
+        mse_bits=3, n_centroids=8, centroid_bits=3,
+        norm_correction=True,
+        use_qjl_residual=True,
+        key_packed_size=64, value_packed_size=68,
+        slot_size=132, slot_size_aligned=132,
     ),
     "turboquant_4bit_nc": dict(
         key_fp8=False, key_quant_bits=4,
         key_mse_bits=4, value_quant_bits=4,
         mse_bits=4, n_centroids=16, centroid_bits=4,
         norm_correction=True,
+        use_qjl_residual=False,
         key_packed_size=66, value_packed_size=68,
         slot_size=134, slot_size_aligned=134,
     ),
@@ -63,14 +75,25 @@ PRESET_EXPECTED = {
         key_mse_bits=3, value_quant_bits=4,
         mse_bits=3, n_centroids=8, centroid_bits=3,
         norm_correction=True,
+        use_qjl_residual=False,
         key_packed_size=50, value_packed_size=68,
         slot_size=118, slot_size_aligned=118,
+    ),
+    "turboquant_3bit": dict(
+        key_fp8=False, key_quant_bits=2,
+        key_mse_bits=2, value_quant_bits=3,
+        mse_bits=2, n_centroids=4, centroid_bits=2,
+        norm_correction=True,
+        use_qjl_residual=True,
+        key_packed_size=44, value_packed_size=52,
+        slot_size=96, slot_size_aligned=96,
     ),
     "turboquant_3bit_nc": dict(
         key_fp8=False, key_quant_bits=3,
         key_mse_bits=3, value_quant_bits=3,
         mse_bits=3, n_centroids=8, centroid_bits=3,
         norm_correction=True,
+        use_qjl_residual=False,
         key_packed_size=50, value_packed_size=52,
         slot_size=102, slot_size_aligned=102,
     ),
@@ -123,6 +146,11 @@ class TestTurboQuantConfig:
         assert cfg.norm_correction is PRESET_EXPECTED[preset]["norm_correction"]
 
     @pytest.mark.parametrize("preset", ALL_PRESETS)
+    def test_qjl_mode(self, preset):
+        cfg = TurboQuantConfig.from_cache_dtype(preset, head_dim=128)
+        assert cfg.use_qjl_residual is PRESET_EXPECTED[preset]["use_qjl_residual"]
+
+    @pytest.mark.parametrize("preset", ALL_PRESETS)
     def test_packed_sizes(self, preset):
         cfg = TurboQuantConfig.from_cache_dtype(preset, head_dim=128)
         exp = PRESET_EXPECTED[preset]
@@ -171,7 +199,7 @@ class TestTurboQuantConfig:
             assert cfg.key_quant_bits == 8
         else:
             assert cfg.key_mse_bits > 0
-            assert cfg.key_quant_bits in (3, 4)
+            assert cfg.key_quant_bits in (2, 3, 4)
 
     @pytest.mark.parametrize("preset", ALL_PRESETS)
     @pytest.mark.parametrize("head_dim", [64, 96, 128, 256])
@@ -460,7 +488,7 @@ class TestStoreDecodeRoundTrip:
 
     @pytest.mark.parametrize(
         "preset",
-        ["turboquant_k8v4", "turboquant_4bit_nc"],
+        ["turboquant_k8v4", "turboquant_4bit_nc", "turboquant_k3v4_nc"],
     )
     def test_single_token_roundtrip(self, preset):
         """Store 1 token, decode with query=key, check attention output.
@@ -494,6 +522,17 @@ class TestStoreDecodeRoundTrip:
         H = _build_hadamard(D, "cuda")
         PiT = (signs.unsqueeze(1) * H).contiguous().float()
         Pi = PiT.T.contiguous()
+        if cfg.use_qjl_residual:
+            qjl_signs = generate_wht_signs(D, seed=43, device=device)
+            PhiT = (qjl_signs.unsqueeze(1) * H).contiguous().float()
+            qjl_scale = torch.tensor(
+                get_residual_scale(D, cfg.key_mse_bits),
+                device=device,
+                dtype=torch.float32,
+            )
+        else:
+            PhiT = None
+            qjl_scale = None
 
         # Generate centroids
         centroids, _ = solve_lloyd_max(D, cfg.centroid_bits)
@@ -526,10 +565,12 @@ class TestStoreDecodeRoundTrip:
             slot_mapping,
             PiT,
             midpoints,
+            PhiT,
             mse_bits=cfg.key_mse_bits,
             key_packed_size=cfg.key_packed_size,
             value_quant_bits=cfg.effective_value_quant_bits,
             key_fp8=cfg.key_fp8,
+            qjl_residual_bits=cfg.qjl_residual_bits,
         )
 
         # Decode: use key as query so attention = softmax([1]) * V = V
@@ -551,6 +592,8 @@ class TestStoreDecodeRoundTrip:
             key_fp8=cfg.key_fp8,
             norm_correction=cfg.norm_correction,
             PiT=PiT,
+            PhiT=PhiT,
+            qjl_scale=qjl_scale,
             max_num_kv_splits=4,
         )
 

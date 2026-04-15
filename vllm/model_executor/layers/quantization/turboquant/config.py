@@ -5,29 +5,51 @@
 import math
 from dataclasses import dataclass
 
+from vllm.v1.attention.ops.turboquant_kv_cache import get_turboquant_layout
+
 # Named TQ presets: each maps to frozen config parameters.
-# key_quant_bits: 8 = FP8 keys, 3-4 = MSE (Lloyd-Max) quantized keys.
+# key_quant_bits: 8 = FP8 keys, 2-4 = MSE (Lloyd-Max) quantized keys.
 # value_quant_bits: 3-4 = uniform quantized values.
+#
+# ``turboquant_4bit`` and ``turboquant_3bit`` are the canonical presets that
+# match the official blog's user-facing naming. The older ``*_nc`` names are
+# kept as compatibility aliases for existing configs and tests.
 TQ_PRESETS: dict[str, dict] = {
     "turboquant_k8v4": {
         "key_quant_bits": 8,
         "value_quant_bits": 4,
         "norm_correction": False,
+        "qjl_residual_bits": 0,
+    },
+    "turboquant_4bit": {
+        "key_quant_bits": 3,
+        "value_quant_bits": 4,
+        "norm_correction": True,
+        "qjl_residual_bits": 1,
     },
     "turboquant_4bit_nc": {
         "key_quant_bits": 4,
         "value_quant_bits": 4,
         "norm_correction": True,
+        "qjl_residual_bits": 0,
     },
     "turboquant_k3v4_nc": {
         "key_quant_bits": 3,
         "value_quant_bits": 4,
         "norm_correction": True,
+        "qjl_residual_bits": 0,
+    },
+    "turboquant_3bit": {
+        "key_quant_bits": 2,
+        "value_quant_bits": 3,
+        "norm_correction": True,
+        "qjl_residual_bits": 1,
     },
     "turboquant_3bit_nc": {
         "key_quant_bits": 3,
         "value_quant_bits": 3,
         "norm_correction": True,
+        "qjl_residual_bits": 0,
     },
 }
 
@@ -36,21 +58,24 @@ TQ_PRESETS: dict[str, dict] = {
 class TurboQuantConfig:
     """Configuration for TurboQuant KV-cache quantization.
 
-    Uses PolarQuant (WHT rotation + Lloyd-Max scalar quantization) for keys
-    and uniform quantization for values. QJL is intentionally omitted —
-    community consensus (5+ independent groups) found it hurts attention
-    quality by amplifying variance through softmax.
+    Uses the current vLLM TurboQuant serving path:
+    1. WHT-rotated Lloyd-Max scalar quantization for keys
+    2. optional 1-bit residual sign correction for the official 3-bit / 4-bit
+       presets
+    3. uniform quantization for values
 
     Named presets (use via --kv-cache-dtype):
         turboquant_k8v4:   FP8 keys + 4-bit values, 2.6x, +1.17% PPL
+        turboquant_4bit:   official-style 4-bit keys (3-bit base + 1-bit residual)
         turboquant_4bit_nc: 4-bit MSE keys + 4-bit values + NC, 3.8x, +2.71%
         turboquant_k3v4_nc: 3-bit MSE keys + 4-bit values + NC, ~3.5x, +10.63%
+        turboquant_3bit:   official-style 3-bit keys (2-bit base + 1-bit residual)
         turboquant_3bit_nc: 3-bit MSE keys + 3-bit values + NC, 4.9x, +20.59%
 
     Args:
         head_dim: Attention head dimension (e.g. 64, 96, 128).
         key_quant_bits: Bits for key quantization. 8 = FP8 keys (no
-            rotation/MSE). 3-4 = Lloyd-Max MSE quantized keys.
+            rotation/MSE). 2-4 = Lloyd-Max MSE quantized keys.
         value_quant_bits: Bits per value dimension for uniform quantization.
             3 = 8 levels, 4 = 16 levels (default).
         seed: Base seed for deterministic random matrix generation.
@@ -61,10 +86,12 @@ class TurboQuantConfig:
     """
 
     head_dim: int = 128
-    key_quant_bits: int = 3  # 3-4 = MSE keys, 8 = FP8 keys
+    key_quant_bits: int = 3  # 2-4 = MSE keys, 8 = FP8 keys
     value_quant_bits: int = 4  # 3-4 = uniform quantized values
     seed: int = 42
     norm_correction: bool = False
+    qjl_residual_bits: int = 0
+    preset_name: str | None = None
 
     @property
     def key_fp8(self) -> bool:
@@ -82,6 +109,26 @@ class TurboQuantConfig:
         if self.key_fp8:
             return self.value_quant_bits
         return self.key_quant_bits
+
+    @property
+    def use_qjl_residual(self) -> bool:
+        return not self.key_fp8 and self.qjl_residual_bits > 0
+
+    @property
+    def use_grouped_layout(self) -> bool:
+        """Whether this preset uses the grouped official-style layout.
+
+        The canonical ``turboquant_4bit`` / ``turboquant_3bit`` modes map to a
+        grouped MSE+QJL representation, while legacy ``*_nc`` presets keep the
+        older flat per-dimension layout.
+        """
+        return self.use_qjl_residual
+
+    @property
+    def grouped_recipe(self) -> str | None:
+        if not self.use_grouped_layout:
+            return None
+        return self.preset_name
 
     @property
     def key_mse_bits(self) -> int:
@@ -109,12 +156,17 @@ class TurboQuantConfig:
         TQ mode:
           - MSE indices: ceil(head_dim * key_mse_bits / 8) bytes
           - vec_norm:     2 bytes (float16)
+          - residual:     ceil(head_dim * qjl_residual_bits / 8) bytes
         """
         if self.key_fp8:
             return self.head_dim  # 1 byte per element
+        if self.use_grouped_layout:
+            assert self.grouped_recipe is not None
+            return get_turboquant_layout(self.grouped_recipe, self.head_dim).packed_dim
         mse_bytes = math.ceil(self.head_dim * self.key_mse_bits / 8)
         norm_bytes = 2  # vec_norm fp16
-        return mse_bytes + norm_bytes
+        qjl_bytes = math.ceil(self.head_dim * self.qjl_residual_bits / 8)
+        return mse_bytes + norm_bytes + qjl_bytes
 
     @property
     def effective_value_quant_bits(self) -> int:
@@ -168,7 +220,8 @@ class TurboQuantConfig:
     def from_cache_dtype(cache_dtype: str, head_dim: int) -> "TurboQuantConfig":
         """Create config from a named preset.
 
-        Valid presets: turboquant_k8v4, turboquant_4bit_nc, etc.
+        Valid presets include turboquant_4bit and turboquant_3bit, along with
+        compatibility aliases such as turboquant_4bit_nc.
         """
         if cache_dtype not in TQ_PRESETS:
             valid = ", ".join(TQ_PRESETS.keys())
@@ -182,4 +235,6 @@ class TurboQuantConfig:
             key_quant_bits=preset["key_quant_bits"],
             value_quant_bits=preset["value_quant_bits"],
             norm_correction=preset["norm_correction"],
+            qjl_residual_bits=preset["qjl_residual_bits"],
+            preset_name=cache_dtype,
         )
