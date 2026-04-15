@@ -27,6 +27,15 @@ import torch.nn.functional as F
 from vllm.config import get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.triton_utils import triton
+from vllm.v1.attention.ops.turboquant_kv_cache import (
+    get_turboquant_centroids,
+    get_turboquant_layout,
+    get_turboquant_mse_to_qjl_matrix,
+    get_turboquant_mse_transform_matrix,
+    get_turboquant_qjl_matrix,
+    get_turboquant_qjl_transform_matrix,
+    get_turboquant_rotation,
+)
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -91,8 +100,10 @@ class TurboQuantAttentionBackend(AttentionBackend):
     ]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "turboquant_k8v4",
+        "turboquant_4bit",
         "turboquant_4bit_nc",
         "turboquant_k3v4_nc",
+        "turboquant_3bit",
         "turboquant_3bit_nc",
     ]
 
@@ -126,7 +137,7 @@ class TurboQuantAttentionBackend(AttentionBackend):
         block_size: int,
         num_kv_heads: int,
         head_size: int,
-        cache_dtype_str: str = "turboquant_4bit_nc",
+        cache_dtype_str: str = "turboquant_4bit",
     ) -> tuple[int, ...]:
         """Combined K+V cache shape — no leading 2 dimension.
 
@@ -285,19 +296,83 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         correct device via register_buffer + model.to(device).
         """
         if not hasattr(layer, "_tq_cached"):
-            D = layer._tq_signs.shape[0]
-            signs = layer._tq_signs.to(device=device, dtype=torch.float32)
+            if self.tq_config.use_grouped_layout:
+                group0_idx = layer._tq_group0_idx.to(device=device)
+                group1_idx = layer._tq_group1_idx.to(device=device)
+                group_dims = (group0_idx.shape[-1], group1_idx.shape[-1])
+                layer._tq_group_indices = (
+                    group0_idx.contiguous(),
+                    group1_idx.contiguous(),
+                )
+                layer._tq_group_rotations = (
+                    get_turboquant_rotation(device, group_dims[0], seed_offset=101),
+                    get_turboquant_rotation(device, group_dims[1], seed_offset=211),
+                )
+                layer._tq_group_qjl = (
+                    get_turboquant_qjl_matrix(device, group_dims[0], seed_offset=307),
+                    get_turboquant_qjl_matrix(device, group_dims[1], seed_offset=401),
+                )
+                layer._tq_group_mse_matrices = (
+                    get_turboquant_mse_transform_matrix(
+                        device, group_dims[0], seed_offset=101
+                    ),
+                    get_turboquant_mse_transform_matrix(
+                        device, group_dims[1], seed_offset=211
+                    ),
+                )
+                layer._tq_group_qjl_matrices = (
+                    get_turboquant_qjl_transform_matrix(
+                        device, group_dims[0], seed_offset=307
+                    ),
+                    get_turboquant_qjl_transform_matrix(
+                        device, group_dims[1], seed_offset=401
+                    ),
+                )
+                layer._tq_group_mse_to_qjl = (
+                    get_turboquant_mse_to_qjl_matrix(
+                        device,
+                        group_dims[0],
+                        mse_seed_offset=101,
+                        qjl_seed_offset=307,
+                    ),
+                    get_turboquant_mse_to_qjl_matrix(
+                        device,
+                        group_dims[1],
+                        mse_seed_offset=211,
+                        qjl_seed_offset=401,
+                    ),
+                )
+                recipe = self.tq_config.grouped_recipe
+                assert recipe is not None
+                layout = get_turboquant_layout(recipe, self.head_size)
+                layer._tq_group_centroids = {
+                    group.mse_bits: get_turboquant_centroids(
+                        device, group.dim, group.mse_bits
+                    )
+                    for group in layout.groups
+                }
+            else:
+                D = layer._tq_signs.shape[0]
+                signs = layer._tq_signs.to(device=device, dtype=torch.float32)
 
-            # WHT rotation: orthonormal + self-inverse, enabling future
-            # in-kernel butterfly fusion and trivial inverse for continuation.
-            H = _build_hadamard(D, str(device))
-            layer._tq_PiT = (signs.unsqueeze(1) * H).contiguous()
-            layer._tq_Pi = layer._tq_PiT.T.contiguous()
+                # WHT rotation: orthonormal + self-inverse, enabling future
+                # in-kernel butterfly fusion and trivial inverse for continuation.
+                H = _build_hadamard(D, str(device))
+                layer._tq_PiT = (signs.unsqueeze(1) * H).contiguous()
+                layer._tq_Pi = layer._tq_PiT.T.contiguous()
 
-            c = layer._tq_centroids.to(device=device, dtype=torch.float32)
-            # Precompute midpoints for threshold-based quantization
-            c_sorted, _ = c.sort()
-            layer._tq_midpoints = (c_sorted[:-1] + c_sorted[1:]) / 2
+                c = layer._tq_centroids.to(device=device, dtype=torch.float32)
+                # Precompute midpoints for threshold-based quantization
+                c_sorted, _ = c.sort()
+                layer._tq_midpoints = (c_sorted[:-1] + c_sorted[1:]) / 2
+                if self.tq_config.use_qjl_residual:
+                    qjl_signs = layer._tq_qjl_signs.to(device=device, dtype=torch.float32)
+                    H_qjl = _build_hadamard(D, str(device))
+                    layer._tq_qjl_PhiT = (qjl_signs.unsqueeze(1) * H_qjl).contiguous()
+                    layer._tq_qjl_Phi = layer._tq_qjl_PhiT.T.contiguous()
+                    layer._tq_qjl_scale_dev = layer._tq_qjl_scale.to(
+                        device=device, dtype=torch.float32
+                    )
             # Decode buffers (_tq_mid_o_buf, _tq_output_buf, _tq_lse_buf)
             # are pre-allocated via register_buffer in Attention.__init__
             # and moved to GPU by model.to(device) — no allocation needed
@@ -366,9 +441,9 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         tq_layer: Any = layer
         device = q.device
         self._ensure_on_device(tq_layer, device)
-        Pi = tq_layer._tq_Pi
-        PiT = tq_layer._tq_PiT
-        centroids = tq_layer._tq_centroids
+        Pi = getattr(tq_layer, "_tq_Pi", None)
+        PiT = getattr(tq_layer, "_tq_PiT", None)
+        centroids = getattr(tq_layer, "_tq_centroids", None)
 
         # Compute attention (KV cache was already updated by do_kv_cache_update)
         # With reorder_batch_threshold=1, decodes come first in the batch.
@@ -480,10 +555,20 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             slot_mapping,
             layer._tq_PiT,
             layer._tq_midpoints,
+            getattr(layer, "_tq_qjl_PhiT", None),
             mse_bits=self.tq_config.key_mse_bits,
             key_packed_size=self.tq_config.key_packed_size,
             value_quant_bits=self.tq_config.effective_value_quant_bits,
             key_fp8=self.tq_config.key_fp8,
+            qjl_residual_bits=self.tq_config.qjl_residual_bits,
+            grouped_recipe=self.tq_config.grouped_recipe,
+            group_rotations=getattr(layer, "_tq_group_rotations", None),
+            group_qjl=getattr(layer, "_tq_group_qjl", None),
+            group_centroids=getattr(layer, "_tq_group_centroids", None),
+            group_indices=getattr(layer, "_tq_group_indices", None),
+            group_mse_matrices=getattr(layer, "_tq_group_mse_matrices", None),
+            group_qjl_matrices=getattr(layer, "_tq_group_qjl_matrices", None),
+            group_mse_to_qjl=getattr(layer, "_tq_group_mse_to_qjl", None),
         )
 
     # ------------------------------------------------------------------ #
@@ -591,9 +676,12 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 # avoid O(cached_len) full-dequant per continuation.
                 # For large continuations, fall back to _continuation_prefill.
                 cached_len = seq_len - q_len
-                if q_len <= _CONTINUATION_DECODE_THRESHOLD:
-                    # Fast path: treat each query as a decode request
-                    # with incremental seq_lens for causal masking.
+                if (
+                    q_len <= _CONTINUATION_DECODE_THRESHOLD
+                    or self.tq_config.use_qjl_residual
+                ):
+                    # Fast path: treat each query as a decode request with
+                    # incremental seq_lens for causal masking.
                     synth_seq_lens = torch.arange(
                         cached_len + 1,
                         seq_len + 1,
@@ -615,6 +703,17 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         key_fp8=self.tq_config.key_fp8,
                         norm_correction=self.tq_config.norm_correction,
                         PiT=PiT,
+                        PhiT=getattr(layer, "_tq_qjl_PhiT", None),
+                        qjl_scale=(
+                            layer._tq_qjl_scale_dev
+                            if self.tq_config.use_qjl_residual
+                            else None
+                        ),
+                        grouped_recipe=self.tq_config.grouped_recipe,
+                        group_rotations=getattr(layer, "_tq_group_rotations", None),
+                        group_qjl=getattr(layer, "_tq_group_qjl", None),
+                        group_centroids=getattr(layer, "_tq_group_centroids", None),
+                        group_indices=getattr(layer, "_tq_group_indices", None),
                     )
                 else:
                     # Large continuation: dequant cached K/V and use
@@ -700,6 +799,11 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             NUM_KV_HEADS=Hk,
             MSE_BYTES=mse_bytes,
             KPS=self.tq_config.key_packed_size,
+            QJL_BYTES=(
+                math.ceil(D * self.tq_config.qjl_residual_bits / 8)
+                if self.tq_config.use_qjl_residual
+                else 0
+            ),
             VQB=self.tq_config.effective_value_quant_bits,
             VAL_DATA_BYTES=val_data_bytes,
             MSE_BITS=self.tq_config.key_mse_bits,
@@ -803,6 +907,15 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             key_fp8=self.tq_config.key_fp8,
             norm_correction=self.tq_config.norm_correction,
             PiT=PiT,
+            PhiT=getattr(layer, "_tq_qjl_PhiT", None),
+            qjl_scale=(
+                layer._tq_qjl_scale_dev if self.tq_config.use_qjl_residual else None
+            ),
+            grouped_recipe=self.tq_config.grouped_recipe,
+            group_rotations=getattr(layer, "_tq_group_rotations", None),
+            group_qjl=getattr(layer, "_tq_group_qjl", None),
+            group_centroids=getattr(layer, "_tq_group_centroids", None),
+            group_indices=getattr(layer, "_tq_group_indices", None),
             mid_o_buf=mid_o_buf,
             output_buf=output_buf,
             lse_buf=lse_buf,
