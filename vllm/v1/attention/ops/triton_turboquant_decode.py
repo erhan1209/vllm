@@ -24,8 +24,6 @@ from vllm.v1.attention.ops.triton_decode_attention import (
 )
 
 _FP8_E4B15: dict[int, int] = {}
-
-
 def _unpack_uniform_values_reference(
     packed: torch.Tensor,
     head_dim: int,
@@ -358,6 +356,278 @@ def _tq_decode_stage1(
     tl.store(Mid_o_ptr + out_base + d_offs, acc / safe_l, mask=d_mask)
     lse = m_prev + tl.log(safe_l)
     tl.store(Mid_o_ptr + out_base + HEAD_DIM, lse)
+
+
+@triton.jit
+def _grouped_tq_decode_stage1(
+    Q_rot_0_ptr,
+    Q_qjl_0_ptr,
+    Q_rot_1_ptr,
+    Q_qjl_1_ptr,
+    KV_cache_ptr,
+    Block_table_ptr,
+    Seq_lens_ptr,
+    Centroids_0_ptr,
+    Centroids_1_ptr,
+    Mid_o_ptr,
+    stride_q0_b,
+    stride_q0_h,
+    stride_q1_b,
+    stride_q1_h,
+    stride_cache_block,
+    stride_cache_pos,
+    stride_cache_head,
+    stride_cache_dim,
+    stride_bt_b,
+    stride_mid_b,
+    stride_mid_h,
+    stride_mid_s,
+    NUM_KV_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_KV_SPLITS: tl.constexpr,
+    KV_GROUP_SIZE: tl.constexpr,
+    KPS: tl.constexpr,
+    VQB: tl.constexpr,
+    VAL_DATA_BYTES: tl.constexpr,
+    ATTN_SCALE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
+    G0_DIM: tl.constexpr,
+    G0_PADDED: tl.constexpr,
+    G0_MSE_BITS: tl.constexpr,
+    G0_GROUP_OFFSET: tl.constexpr,
+    G0_QJL_OFFSET: tl.constexpr,
+    G0_VECTOR_NORM_OFFSET: tl.constexpr,
+    G0_RESIDUAL_NORM_OFFSET: tl.constexpr,
+    G0_QJL_SCALE: tl.constexpr,
+    G1_DIM: tl.constexpr,
+    G1_PADDED: tl.constexpr,
+    G1_MSE_BITS: tl.constexpr,
+    G1_GROUP_OFFSET: tl.constexpr,
+    G1_QJL_OFFSET: tl.constexpr,
+    G1_VECTOR_NORM_OFFSET: tl.constexpr,
+    G1_RESIDUAL_NORM_OFFSET: tl.constexpr,
+    G1_QJL_SCALE: tl.constexpr,
+):
+    bid = tl.program_id(0)
+    hid = tl.program_id(1)
+    sid = tl.program_id(2)
+
+    kv_head = hid // KV_GROUP_SIZE
+    seq_len = tl.load(Seq_lens_ptr + bid)
+    split_len = tl.cdiv(seq_len, NUM_KV_SPLITS)
+    split_start = split_len * sid
+    split_end = tl.minimum(split_start + split_len, seq_len)
+    if split_start >= split_end:
+        return
+
+    d_offs = tl.arange(0, BLOCK_D)
+    d_mask = d_offs < HEAD_DIM
+    kv_range = tl.arange(0, BLOCK_KV)
+    offs_d0 = tl.arange(0, G0_PADDED)
+    mask_d0 = offs_d0 < G0_DIM
+    offs_d1 = tl.arange(0, G1_PADDED)
+    mask_d1 = offs_d1 < G1_DIM
+
+    q0_base = bid * stride_q0_b + hid * stride_q0_h
+    q_rot_0 = tl.load(
+        Q_rot_0_ptr + q0_base + offs_d0, mask=mask_d0, other=0.0
+    ).to(tl.float32)
+    q_qjl_0 = tl.load(
+        Q_qjl_0_ptr + q0_base + offs_d0, mask=mask_d0, other=0.0
+    ).to(tl.float32)
+    q1_base = bid * stride_q1_b + hid * stride_q1_h
+    q_rot_1 = tl.load(
+        Q_rot_1_ptr + q1_base + offs_d1, mask=mask_d1, other=0.0
+    ).to(tl.float32)
+    q_qjl_1 = tl.load(
+        Q_qjl_1_ptr + q1_base + offs_d1, mask=mask_d1, other=0.0
+    ).to(tl.float32)
+
+    if VQB == 3:
+        val_bit_off = d_offs * 3
+        val_byte_idx = val_bit_off // 8
+        val_bit_shift = val_bit_off % 8
+
+    m_prev = -float("inf")
+    l_prev = 0.0
+    acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+    bt_base = bid * stride_bt_b
+
+    for start_n in range(split_start, split_end, BLOCK_KV):
+        kv_offs = start_n + kv_range
+        kv_mask = kv_offs < split_end
+        page_idx = kv_offs // BLOCK_SIZE
+        page_off = kv_offs % BLOCK_SIZE
+        block_nums = tl.load(
+            Block_table_ptr + bt_base + page_idx,
+            mask=kv_mask,
+            other=0,
+        )
+        slot_bases = (
+            block_nums * stride_cache_block
+            + page_off * stride_cache_pos
+            + kv_head * stride_cache_head
+        )
+
+        key_indices_0 = _grouped_unpack_fixed_indices(
+            KV_cache_ptr,
+            slot_bases,
+            offs_d0,
+            stride_cache_dim,
+            G0_MSE_BITS,
+            BLOCK_KV,
+            G0_PADDED,
+            G0_GROUP_OFFSET,
+            kv_mask[:, None] & mask_d0[None, :],
+        )
+        key_centroids_0 = tl.load(
+            Centroids_0_ptr + key_indices_0,
+            mask=kv_mask[:, None] & mask_d0[None, :],
+            other=0.0,
+        )
+        key_qjl_signs_0 = _grouped_unpack_signs(
+            KV_cache_ptr,
+            slot_bases,
+            offs_d0,
+            stride_cache_dim,
+            G0_QJL_OFFSET,
+            kv_mask[:, None] & mask_d0[None, :],
+        )
+        key_vector_norm_0_base = slot_bases + G0_VECTOR_NORM_OFFSET * stride_cache_dim
+        kv0_lo = tl.load(KV_cache_ptr + key_vector_norm_0_base, mask=kv_mask, other=0).to(
+            tl.uint16
+        )
+        kv0_hi = tl.load(
+            KV_cache_ptr + key_vector_norm_0_base + stride_cache_dim,
+            mask=kv_mask,
+            other=0,
+        ).to(tl.uint16)
+        key_vector_norm_0 = (kv0_lo | (kv0_hi << 8)).to(
+            tl.float16, bitcast=True
+        ).to(tl.float32)
+        kr0_base = slot_bases + G0_RESIDUAL_NORM_OFFSET * stride_cache_dim
+        kr0_lo = tl.load(KV_cache_ptr + kr0_base, mask=kv_mask, other=0).to(tl.uint16)
+        kr0_hi = tl.load(
+            KV_cache_ptr + kr0_base + stride_cache_dim, mask=kv_mask, other=0
+        ).to(tl.uint16)
+        key_residual_norm_0 = (kr0_lo | (kr0_hi << 8)).to(
+            tl.float16, bitcast=True
+        ).to(tl.float32)
+
+        key_indices_1 = _grouped_unpack_fixed_indices(
+            KV_cache_ptr,
+            slot_bases,
+            offs_d1,
+            stride_cache_dim,
+            G1_MSE_BITS,
+            BLOCK_KV,
+            G1_PADDED,
+            G1_GROUP_OFFSET,
+            kv_mask[:, None] & mask_d1[None, :],
+        )
+        key_centroids_1 = tl.load(
+            Centroids_1_ptr + key_indices_1,
+            mask=kv_mask[:, None] & mask_d1[None, :],
+            other=0.0,
+        )
+        key_qjl_signs_1 = _grouped_unpack_signs(
+            KV_cache_ptr,
+            slot_bases,
+            offs_d1,
+            stride_cache_dim,
+            G1_QJL_OFFSET,
+            kv_mask[:, None] & mask_d1[None, :],
+        )
+        key_vector_norm_1_base = slot_bases + G1_VECTOR_NORM_OFFSET * stride_cache_dim
+        kv1_lo = tl.load(KV_cache_ptr + key_vector_norm_1_base, mask=kv_mask, other=0).to(
+            tl.uint16
+        )
+        kv1_hi = tl.load(
+            KV_cache_ptr + key_vector_norm_1_base + stride_cache_dim,
+            mask=kv_mask,
+            other=0,
+        ).to(tl.uint16)
+        key_vector_norm_1 = (kv1_lo | (kv1_hi << 8)).to(
+            tl.float16, bitcast=True
+        ).to(tl.float32)
+        kr1_base = slot_bases + G1_RESIDUAL_NORM_OFFSET * stride_cache_dim
+        kr1_lo = tl.load(KV_cache_ptr + kr1_base, mask=kv_mask, other=0).to(tl.uint16)
+        kr1_hi = tl.load(
+            KV_cache_ptr + kr1_base + stride_cache_dim, mask=kv_mask, other=0
+        ).to(tl.uint16)
+        key_residual_norm_1 = (kr1_lo | (kr1_hi << 8)).to(
+            tl.float16, bitcast=True
+        ).to(tl.float32)
+
+        scores = key_vector_norm_0 * tl.sum(
+            key_centroids_0 * q_rot_0[None, :], axis=1
+        )
+        scores += key_vector_norm_0 * key_residual_norm_0 * G0_QJL_SCALE * tl.sum(
+            key_qjl_signs_0 * q_qjl_0[None, :], axis=1
+        )
+        scores += key_vector_norm_1 * tl.sum(
+            key_centroids_1 * q_rot_1[None, :], axis=1
+        )
+        scores += key_vector_norm_1 * key_residual_norm_1 * G1_QJL_SCALE * tl.sum(
+            key_qjl_signs_1 * q_qjl_1[None, :], axis=1
+        )
+        scores = tl.where(kv_mask, scores * ATTN_SCALE, -float("inf"))
+
+        n_e_max = tl.maximum(tl.max(scores, 0), m_prev)
+        re_scale = tl.exp(m_prev - n_e_max)
+        p = tl.exp(scores - n_e_max)
+
+        val_bases = slot_bases + KPS * stride_cache_dim
+        if VQB == 3:
+            val_addrs0 = val_bases[:, None] + val_byte_idx[None, :] * stride_cache_dim
+            val_raw0 = tl.load(
+                KV_cache_ptr + val_addrs0,
+                mask=kv_mask[:, None] & d_mask[None, :],
+                other=0,
+            ).to(tl.int32)
+            val_raw1 = tl.load(
+                KV_cache_ptr + val_addrs0 + stride_cache_dim,
+                mask=kv_mask[:, None] & d_mask[None, :],
+                other=0,
+            ).to(tl.int32)
+            raw16 = val_raw0 | (val_raw1 << 8)
+            v_idx = ((raw16 >> val_bit_shift[None, :]) & 0x7).to(tl.float32)
+        else:
+            vb_idx = d_offs // 2
+            vb_shift = (d_offs % 2) * 4
+            val_addrs = val_bases[:, None] + vb_idx[None, :] * stride_cache_dim
+            val_raw = tl.load(
+                KV_cache_ptr + val_addrs,
+                mask=kv_mask[:, None] & d_mask[None, :],
+                other=0,
+            ).to(tl.int32)
+            v_idx = ((val_raw >> vb_shift[None, :]) & 0xF).to(tl.float32)
+
+        sc_bases = val_bases + VAL_DATA_BYTES * stride_cache_dim
+        sc_lo = tl.load(KV_cache_ptr + sc_bases, mask=kv_mask, other=0).to(tl.uint16)
+        sc_hi = tl.load(
+            KV_cache_ptr + sc_bases + stride_cache_dim, mask=kv_mask, other=0
+        ).to(tl.uint16)
+        v_scales = (sc_lo | (sc_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+        zr_lo = tl.load(
+            KV_cache_ptr + sc_bases + 2 * stride_cache_dim, mask=kv_mask, other=0
+        ).to(tl.uint16)
+        zr_hi = tl.load(
+            KV_cache_ptr + sc_bases + 3 * stride_cache_dim, mask=kv_mask, other=0
+        ).to(tl.uint16)
+        v_zeros = (zr_lo | (zr_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+        values = v_idx * v_scales[:, None] + v_zeros[:, None]
+
+        acc = acc * re_scale + tl.sum(p[:, None] * values, 0)
+        l_prev = l_prev * re_scale + tl.sum(p, 0)
+        m_prev = n_e_max
+
+    out_base = bid * stride_mid_b + hid * stride_mid_h + sid * stride_mid_s
+    safe_l = tl.where(l_prev > 0.0, l_prev, 1.0)
+    tl.store(Mid_o_ptr + out_base + d_offs, acc / safe_l, mask=d_mask)
+    tl.store(Mid_o_ptr + out_base + HEAD_DIM, m_prev + tl.log(safe_l))
 
 
 # ---------------------------------------------------------------------------

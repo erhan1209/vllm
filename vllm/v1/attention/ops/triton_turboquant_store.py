@@ -389,6 +389,59 @@ def _tq_fused_store_mse(
     )
 
 
+@triton.jit
+def _tq_grouped_store_value(
+    Value_ptr,
+    KV_cache_ptr,
+    Slot_mapping_ptr,
+    stride_cache_block: tl.constexpr,
+    stride_cache_pos: tl.constexpr,
+    stride_cache_head: tl.constexpr,
+    stride_cache_dim: tl.constexpr,
+    D: tl.constexpr,
+    H: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    KPS: tl.constexpr,
+    VQB: tl.constexpr,
+    VAL_DATA_BYTES: tl.constexpr,
+    BLOCK_VAL: tl.constexpr,
+    BLOCK_GRP: tl.constexpr = 16,
+):
+    pid = tl.program_id(0)
+    token_idx = pid // H
+    head_idx = pid % H
+
+    slot = tl.load(Slot_mapping_ptr + token_idx)
+    if slot < 0:
+        return
+    blk = slot // BLOCK_SIZE
+    off = slot % BLOCK_SIZE
+    slot_base = (
+        blk * stride_cache_block + off * stride_cache_pos + head_idx * stride_cache_head
+    )
+
+    base = pid * D
+    d_offs = tl.arange(0, BLOCK_D)
+    d_mask = d_offs < D
+
+    _store_quantized_value(
+        Value_ptr,
+        KV_cache_ptr,
+        base,
+        slot_base,
+        d_offs,
+        d_mask,
+        D=D,
+        KPS=KPS * stride_cache_dim,
+        VQB=VQB,
+        VAL_DATA_BYTES=VAL_DATA_BYTES * stride_cache_dim,
+        BLOCK_D=BLOCK_D,
+        BLOCK_VAL=BLOCK_VAL,
+        BLOCK_GRP=BLOCK_GRP,
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Launcher
 # ═══════════════════════════════════════════════════════════════════════
